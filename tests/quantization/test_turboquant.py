@@ -900,3 +900,313 @@ class TestTritonKernels:
             "Triton/PyTorch value mismatch: max diff = "
             f"{(v_cpu - v_gpu.cpu()).abs().max():.6f}"
         )
+
+
+# ---- Phase 4: Fused decode attention ----
+
+
+def _reference_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    seq_lens: torch.Tensor,
+) -> torch.Tensor:
+    """Reference attention via PyTorch (no quantization).
+
+    Args:
+        q: (batch, num_q_heads, head_dim)
+        k: (batch, max_seq, num_kv_heads, head_dim)
+        v: (batch, max_seq, num_kv_heads, head_dim)
+        seq_lens: (batch,) int
+
+    Returns:
+        (batch, num_q_heads, head_dim)
+    """
+    batch, num_q_heads, head_dim = q.shape
+    num_kv_heads = k.shape[2]
+    kv_group = num_q_heads // num_kv_heads
+    sm_scale = 1.0 / (head_dim**0.5)
+
+    outputs = []
+    for b in range(batch):
+        sl = seq_lens[b].item()
+        for h in range(num_q_heads):
+            kv_h = h // kv_group
+            q_vec = q[b, h]  # (D,)
+            k_mat = k[b, :sl, kv_h]  # (sl, D)
+            v_mat = v[b, :sl, kv_h]  # (sl, D)
+
+            scores = (k_mat @ q_vec) * sm_scale  # (sl,)
+            weights = torch.softmax(scores, dim=0)  # (sl,)
+            out = weights @ v_mat  # (D,)
+            outputs.append(out)
+
+    return torch.stack(outputs).view(batch, num_q_heads, head_dim)
+
+
+@pytest.mark.skipif(
+    not (HAS_TRITON and torch.cuda.is_available()),
+    reason="Fused attention requires GPU and Triton",
+)
+class TestTurboQuantFusedAttention:
+    """Tests for Phase 4 fused decode attention kernel."""
+
+    def _quantize_kv(self, k, v, signs_k, signs_v, centroids, boundaries, head_dim):
+        """Quantize K/V to indices + norms using PyTorch reference."""
+        results = []
+        for x, signs in [(k, signs_k), (v, signs_v)]:
+            x_f = x.float()
+            norms = torch.norm(x_f, dim=-1)
+            safe_norms = norms.clamp(min=1e-10)
+            x_norm = x_f / safe_norms.unsqueeze(-1)
+
+            y = x_norm * signs
+            y = fast_walsh_hadamard_transform(y, normalize=True)
+
+            y_exp = y.unsqueeze(-1)
+            b_exp = boundaries.view(*([1] * len(y.shape)), -1)
+            indices = (y_exp > b_exp).sum(dim=-1).to(torch.uint8)
+
+            results.append((indices, norms.half()))
+        return results[0][0], results[0][1], results[1][0], results[1][1]
+
+    def test_fused_attention_basic(self):
+        """Fused attention should produce valid output shape."""
+        from vllm.model_executor.layers.quantization.turboquant.fused_attention import (
+            turboquant_decode_attention,
+        )
+
+        device = "cuda"
+        batch, num_q_heads, num_kv_heads, head_dim = 4, 8, 8, 128
+        max_seq = 256
+
+        signs_k = generate_random_signs(head_dim, 42, device)
+        signs_v = generate_random_signs(head_dim, 43, device)
+        centroids, boundaries = LloydMaxCodebook.get(3, head_dim, device)
+        M_fwd_k, M_inv_k = make_rotation_matrices(signs_k, device)
+        M_fwd_v, M_inv_v = make_rotation_matrices(signs_v, device)
+
+        q = torch.randn(batch, num_q_heads, head_dim, device=device)
+        k = torch.randn(batch, max_seq, num_kv_heads, head_dim, device=device)
+        v = torch.randn(batch, max_seq, num_kv_heads, head_dim, device=device)
+        seq_lens = torch.full((batch,), max_seq, dtype=torch.int32, device=device)
+
+        ki, kn, vi, vn = self._quantize_kv(
+            k, v, signs_k, signs_v, centroids, boundaries, head_dim
+        )
+
+        out = turboquant_decode_attention(
+            q,
+            ki,
+            kn,
+            vi,
+            vn,
+            seq_lens,
+            M_fwd_k,
+            M_inv_k,
+            M_fwd_v,
+            centroids,
+        )
+
+        assert out.shape == (batch, num_q_heads, head_dim)
+        assert out.dtype == torch.float32
+        assert torch.isfinite(out).all()
+
+    def test_fused_vs_separate_dequant(self):
+        """Fused attention should match separate dequantize + attention."""
+        from vllm.model_executor.layers.quantization.turboquant.fused_attention import (
+            turboquant_decode_attention,
+        )
+
+        device = "cuda"
+        batch, num_q_heads, num_kv_heads, head_dim = 2, 4, 4, 64
+        max_seq = 128
+        bit_width = 3
+
+        signs_k = generate_random_signs(head_dim, 42, device)
+        signs_v = generate_random_signs(head_dim, 43, device)
+        centroids, boundaries = LloydMaxCodebook.get(bit_width, head_dim, device)
+        M_fwd_k, M_inv_k = make_rotation_matrices(signs_k, device)
+        M_fwd_v, M_inv_v = make_rotation_matrices(signs_v, device)
+
+        q = torch.randn(batch, num_q_heads, head_dim, device=device)
+        k_raw = torch.randn(batch, max_seq, num_kv_heads, head_dim, device=device)
+        v_raw = torch.randn(batch, max_seq, num_kv_heads, head_dim, device=device)
+        seq_lens = torch.full((batch,), max_seq, dtype=torch.int32, device=device)
+
+        # Quantize
+        ki, kn, vi, vn = self._quantize_kv(
+            k_raw,
+            v_raw,
+            signs_k,
+            signs_v,
+            centroids,
+            boundaries,
+            head_dim,
+        )
+
+        # Fused attention
+        out_fused = turboquant_decode_attention(
+            q,
+            ki,
+            kn,
+            vi,
+            vn,
+            seq_lens,
+            M_fwd_k,
+            M_inv_k,
+            M_fwd_v,
+            centroids,
+        )
+
+        # Reference: dequantize then standard attention
+        # Dequantize K
+        k_dequant = centroids[ki.long()].float()
+        k_orig = (k_dequant @ M_fwd_k) * kn.float().unsqueeze(-1)
+
+        # Dequantize V
+        v_dequant = centroids[vi.long()].float()
+        v_orig = (v_dequant @ M_fwd_v) * vn.float().unsqueeze(-1)
+
+        out_ref = _reference_attention(
+            q.float(),
+            k_orig,
+            v_orig,
+            seq_lens,
+        ).to(device)
+
+        assert torch.allclose(
+            out_fused,
+            out_ref,
+            atol=5e-2,
+            rtol=5e-2,
+        ), (
+            "Fused vs reference mismatch: "
+            f"max diff = {(out_fused - out_ref).abs().max():.6f}, "
+            f"mean diff = {(out_fused - out_ref).abs().mean():.6f}"
+        )
+
+    def test_variable_seq_lens(self):
+        """Should handle different sequence lengths per batch item."""
+        from vllm.model_executor.layers.quantization.turboquant.fused_attention import (
+            turboquant_decode_attention,
+        )
+
+        device = "cuda"
+        batch, num_q_heads, num_kv_heads, head_dim = 4, 4, 4, 64
+        max_seq = 256
+
+        signs_k = generate_random_signs(head_dim, 42, device)
+        signs_v = generate_random_signs(head_dim, 43, device)
+        centroids, boundaries = LloydMaxCodebook.get(3, head_dim, device)
+        M_fwd_k, M_inv_k = make_rotation_matrices(signs_k, device)
+        M_fwd_v, M_inv_v = make_rotation_matrices(signs_v, device)
+
+        q = torch.randn(batch, num_q_heads, head_dim, device=device)
+        k = torch.randn(batch, max_seq, num_kv_heads, head_dim, device=device)
+        v = torch.randn(batch, max_seq, num_kv_heads, head_dim, device=device)
+        # Different lengths
+        seq_lens = torch.tensor([64, 128, 200, 256], dtype=torch.int32, device=device)
+
+        ki, kn, vi, vn = self._quantize_kv(
+            k, v, signs_k, signs_v, centroids, boundaries, head_dim
+        )
+
+        out = turboquant_decode_attention(
+            q,
+            ki,
+            kn,
+            vi,
+            vn,
+            seq_lens,
+            M_fwd_k,
+            M_inv_k,
+            M_fwd_v,
+            centroids,
+        )
+
+        assert out.shape == (batch, num_q_heads, head_dim)
+        assert torch.isfinite(out).all()
+
+    def test_gqa_support(self):
+        """Should support grouped query attention (GQA)."""
+        from vllm.model_executor.layers.quantization.turboquant.fused_attention import (
+            turboquant_decode_attention,
+        )
+
+        device = "cuda"
+        batch, num_q_heads, num_kv_heads, head_dim = 2, 8, 2, 64
+        max_seq = 64
+
+        signs_k = generate_random_signs(head_dim, 42, device)
+        signs_v = generate_random_signs(head_dim, 43, device)
+        centroids, boundaries = LloydMaxCodebook.get(3, head_dim, device)
+        M_fwd_k, M_inv_k = make_rotation_matrices(signs_k, device)
+        M_fwd_v, M_inv_v = make_rotation_matrices(signs_v, device)
+
+        q = torch.randn(batch, num_q_heads, head_dim, device=device)
+        k = torch.randn(batch, max_seq, num_kv_heads, head_dim, device=device)
+        v = torch.randn(batch, max_seq, num_kv_heads, head_dim, device=device)
+        seq_lens = torch.full((batch,), max_seq, dtype=torch.int32, device=device)
+
+        ki, kn, vi, vn = self._quantize_kv(
+            k, v, signs_k, signs_v, centroids, boundaries, head_dim
+        )
+
+        out = turboquant_decode_attention(
+            q,
+            ki,
+            kn,
+            vi,
+            vn,
+            seq_lens,
+            M_fwd_k,
+            M_inv_k,
+            M_fwd_v,
+            centroids,
+        )
+
+        assert out.shape == (batch, num_q_heads, head_dim)
+        assert torch.isfinite(out).all()
+
+    @pytest.mark.parametrize("bit_width", [2, 3, 4])
+    def test_bit_widths(self, bit_width: int):
+        """Should work with different bit-widths."""
+        from vllm.model_executor.layers.quantization.turboquant.fused_attention import (
+            turboquant_decode_attention,
+        )
+
+        device = "cuda"
+        batch, num_q_heads, num_kv_heads, head_dim = 2, 4, 4, 128
+        max_seq = 64
+
+        signs_k = generate_random_signs(head_dim, 42, device)
+        signs_v = generate_random_signs(head_dim, 43, device)
+        centroids, boundaries = LloydMaxCodebook.get(bit_width, head_dim, device)
+        M_fwd_k, M_inv_k = make_rotation_matrices(signs_k, device)
+        M_fwd_v, M_inv_v = make_rotation_matrices(signs_v, device)
+
+        q = torch.randn(batch, num_q_heads, head_dim, device=device)
+        k = torch.randn(batch, max_seq, num_kv_heads, head_dim, device=device)
+        v = torch.randn(batch, max_seq, num_kv_heads, head_dim, device=device)
+        seq_lens = torch.full((batch,), max_seq, dtype=torch.int32, device=device)
+
+        ki, kn, vi, vn = self._quantize_kv(
+            k, v, signs_k, signs_v, centroids, boundaries, head_dim
+        )
+
+        out = turboquant_decode_attention(
+            q,
+            ki,
+            kn,
+            vi,
+            vn,
+            seq_lens,
+            M_fwd_k,
+            M_inv_k,
+            M_fwd_v,
+            centroids,
+        )
+
+        assert out.shape == (batch, num_q_heads, head_dim)
+        assert torch.isfinite(out).all()

@@ -4,6 +4,9 @@
 from vllm.model_executor.layers.quantization.turboquant.config import (
     TurboQuantConfig,
 )
+from vllm.model_executor.layers.quantization.turboquant.fused_attention import (
+    turboquant_decode_attention,
+)
 from vllm.model_executor.layers.quantization.turboquant.triton_kernels import (
     make_rotation_matrices,
     turboquant_dequantize,
@@ -14,6 +17,7 @@ from vllm.model_executor.layers.quantization.turboquant.triton_kernels import (
 __all__ = [
     "TurboQuantConfig",
     "make_rotation_matrices",
+    "turboquant_decode_attention",
     "turboquant_dequantize",
     "turboquant_fused_qd",
     "turboquant_quantize",
