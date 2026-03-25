@@ -9,6 +9,8 @@ Tests cover:
 4. TurboQuantMSE distortion bounds.
 5. TurboQuantProd unbiasedness.
 6. Config registration.
+7. KV Compressor (Phase 2).
+8. Triton kernels and rotation matrices (Phase 3).
 """
 
 import math
@@ -35,6 +37,11 @@ from vllm.model_executor.layers.quantization.turboquant.rotation import (
     inverse_randomized_hadamard_transform,
     randomized_hadamard_transform,
 )
+from vllm.model_executor.layers.quantization.turboquant.triton_kernels import (
+    _make_hadamard_matrix,
+    make_rotation_matrices,
+)
+from vllm.triton_utils import HAS_TRITON
 
 DEVICE = "cpu"
 
@@ -467,3 +474,429 @@ class TestTurboQuantKVCompressor:
         r = repr(compressor)
         assert "TurboQuantKVCompressor" in r
         assert "3.5" in r
+
+
+# ---- Phase 3: Rotation matrices and Triton kernels ----
+
+
+class TestHadamardMatrix:
+    @pytest.mark.parametrize("d", [2, 4, 8, 16, 64, 128])
+    def test_hadamard_orthogonal(self, d: int):
+        """Hadamard matrix should be orthogonal: H @ H^T = d * I."""
+        H = _make_hadamard_matrix(d, DEVICE)
+        product = H @ H.t()
+        expected = d * torch.eye(d)
+        assert torch.allclose(product, expected, atol=1e-4), (
+            f"H @ H^T not equal to {d} * I for d={d}"
+        )
+
+    @pytest.mark.parametrize("d", [2, 4, 8, 64, 128])
+    def test_hadamard_symmetric(self, d: int):
+        """Hadamard matrix should be symmetric."""
+        H = _make_hadamard_matrix(d, DEVICE)
+        assert torch.allclose(H, H.t(), atol=1e-6)
+
+    @pytest.mark.parametrize("d", [2, 4, 8, 64, 128])
+    def test_hadamard_entries(self, d: int):
+        """Hadamard entries should be +1 or -1."""
+        H = _make_hadamard_matrix(d, DEVICE)
+        assert torch.all((H == 1.0) | (H == -1.0))
+
+
+class TestRotationMatrices:
+    def test_rotation_round_trip(self):
+        """M_fwd^T should equal M_inv (for correct inverse rotation)."""
+        signs = generate_random_signs(128, seed=42, device=DEVICE)
+        M_fwd, M_inv = make_rotation_matrices(signs, DEVICE)
+
+        # M_inv should be M_fwd^T
+        assert torch.allclose(M_fwd.t(), M_inv, atol=1e-5), (
+            "M_inv should equal M_fwd transposed"
+        )
+
+    def test_rotation_preserves_norm(self):
+        """Rotation via matrix multiply should preserve L2 norms."""
+        signs = generate_random_signs(128, seed=42, device=DEVICE)
+        M_fwd, M_inv = make_rotation_matrices(signs, DEVICE)
+
+        x = torch.randn(32, 128)
+        # Forward: Y = X @ M_inv (= X @ M_fwd^T)
+        y = x @ M_inv
+
+        x_norms = torch.norm(x, dim=-1)
+        y_norms = torch.norm(y, dim=-1)
+        assert torch.allclose(x_norms, y_norms, atol=1e-4)
+
+    def test_matrix_matches_butterfly(self):
+        """Matrix rotation should match butterfly Walsh-Hadamard rotation."""
+        signs = generate_random_signs(128, seed=42, device=DEVICE)
+        M_fwd, M_inv = make_rotation_matrices(signs, DEVICE)
+
+        x = torch.randn(16, 128)
+
+        # Reference: butterfly Walsh-Hadamard
+        y_ref = randomized_hadamard_transform(x, signs, normalize=True)
+
+        # Matrix multiply: Y = X @ M_fwd^T = X @ M_inv
+        y_mat = x @ M_inv
+
+        assert torch.allclose(y_ref, y_mat, atol=1e-4), (
+            "Matrix rotation should match butterfly Walsh-Hadamard"
+        )
+
+    def test_inverse_matrix_matches_butterfly(self):
+        """Inverse matrix rotation should match butterfly inverse."""
+        signs = generate_random_signs(64, seed=99, device=DEVICE)
+        M_fwd, M_inv = make_rotation_matrices(signs, DEVICE)
+
+        # Start from rotated values
+        y = torch.randn(8, 64)
+
+        # Reference: butterfly inverse Walsh-Hadamard
+        x_ref = inverse_randomized_hadamard_transform(y, signs, normalize=True)
+
+        # Matrix multiply: X = Y @ M_fwd
+        x_mat = y @ M_inv.t()
+
+        assert torch.allclose(x_ref, x_mat, atol=1e-4), (
+            "Inverse matrix rotation should match butterfly inverse"
+        )
+
+    def test_full_round_trip_via_matrices(self):
+        """Forward then inverse rotation via matrices recovers input."""
+        signs = generate_random_signs(128, seed=42, device=DEVICE)
+        M_fwd, M_inv = make_rotation_matrices(signs, DEVICE)
+
+        x = torch.randn(16, 128)
+        y = x @ M_inv  # forward
+        x_hat = y @ M_fwd  # inverse
+        assert torch.allclose(x, x_hat, atol=1e-4)
+
+
+@pytest.mark.skipif(
+    not (HAS_TRITON and torch.cuda.is_available()),
+    reason="Triton kernels require GPU and Triton",
+)
+class TestTritonKernels:
+    """Tests for Triton fused kernels (Phase 3).
+
+    These require a CUDA GPU with Triton support.
+    """
+
+    def _get_reference_qd(
+        self,
+        x,
+        signs,
+        centroids,
+        boundaries,
+        has_outliers=False,
+        centroids_outlier=None,
+        boundaries_outlier=None,
+        normal_mask=None,
+        outlier_mask=None,
+    ):
+        """PyTorch reference quantize-dequantize for comparison."""
+        x_float = x.float()
+        norms = torch.norm(x_float, dim=-1, keepdim=True)
+        safe_norms = norms.clamp(min=1e-10)
+        x_normalized = x_float / safe_norms
+
+        y = x_normalized * signs
+        y = fast_walsh_hadamard_transform(y, normalize=True)
+
+        if has_outliers:
+            y_q = torch.empty_like(y)
+            y_expanded = y[..., normal_mask].unsqueeze(-1)
+            b_expanded = boundaries.view(*([1] * len(y_expanded.shape[:-1])), -1)
+            idx_n = (y_expanded > b_expanded).sum(dim=-1)
+            y_q[..., normal_mask] = centroids[idx_n.long()]
+
+            y_expanded_o = y[..., outlier_mask].unsqueeze(-1)
+            b_expanded_o = boundaries_outlier.view(
+                *([1] * len(y_expanded_o.shape[:-1])), -1
+            )
+            idx_o = (y_expanded_o > b_expanded_o).sum(dim=-1)
+            y_q[..., outlier_mask] = centroids_outlier[idx_o.long()]
+        else:
+            y_expanded = y.unsqueeze(-1)
+            b_expanded = boundaries.view(*([1] * len(y.shape)), -1)
+            indices = (y_expanded > b_expanded).sum(dim=-1)
+            y_q = centroids[indices.long()]
+
+        x_hat = fast_walsh_hadamard_transform(y_q, normalize=True)
+        x_hat = x_hat * signs
+        x_hat = x_hat * norms
+        return x_hat
+
+    @pytest.mark.parametrize("bit_width", [2, 3, 4])
+    def test_fused_qd_matches_reference(self, bit_width: int):
+        """Triton fused QD should match PyTorch reference."""
+        from vllm.model_executor.layers.quantization.turboquant.triton_kernels import (
+            turboquant_fused_qd,
+        )
+
+        device = "cuda"
+        head_dim = 128
+        num_tokens, num_heads = 32, 4
+
+        signs = generate_random_signs(head_dim, seed=42, device=device)
+        centroids, boundaries = LloydMaxCodebook.get(bit_width, head_dim, device)
+        M_fwd, M_inv = make_rotation_matrices(signs, device)
+
+        x = torch.randn(
+            num_tokens,
+            num_heads,
+            head_dim,
+            device=device,
+            dtype=torch.float32,
+        )
+
+        # Triton result
+        out_triton = turboquant_fused_qd(
+            x,
+            M_fwd,
+            M_inv,
+            centroids,
+            boundaries,
+        )
+
+        # Reference result
+        out_ref = self._get_reference_qd(x, signs, centroids, boundaries)
+
+        assert torch.allclose(out_triton, out_ref, atol=1e-2, rtol=1e-2), (
+            f"Triton QD mismatch at {bit_width} bits: "
+            f"max diff = {(out_triton - out_ref).abs().max():.6f}"
+        )
+
+    def test_fused_qd_shape_and_dtype(self):
+        """Fused QD should return correct shape."""
+        from vllm.model_executor.layers.quantization.turboquant.triton_kernels import (
+            turboquant_fused_qd,
+        )
+
+        device = "cuda"
+        head_dim = 64
+        signs = generate_random_signs(head_dim, seed=42, device=device)
+        centroids, boundaries = LloydMaxCodebook.get(3, head_dim, device)
+        M_fwd, M_inv = make_rotation_matrices(signs, device)
+
+        x = torch.randn(16, 8, head_dim, device=device, dtype=torch.float16)
+        out = turboquant_fused_qd(x, M_fwd, M_inv, centroids, boundaries)
+
+        assert out.shape == x.shape
+        assert out.dtype == torch.float32  # kernel outputs float32
+
+    def test_fused_qd_with_outliers(self):
+        """Fused QD with mixed-precision outlier channels."""
+        from vllm.model_executor.layers.quantization.turboquant.triton_kernels import (
+            turboquant_fused_qd,
+        )
+
+        device = "cuda"
+        head_dim = 128
+        n_outlier = 32
+        n_normal = head_dim - n_outlier
+
+        signs = generate_random_signs(head_dim, seed=42, device=device)
+        centroids_n, boundaries_n = LloydMaxCodebook.get(3, head_dim, device)
+        centroids_o, boundaries_o = LloydMaxCodebook.get(4, head_dim, device)
+        M_fwd, M_inv = make_rotation_matrices(signs, device)
+
+        x = torch.randn(16, 4, head_dim, device=device)
+        out = turboquant_fused_qd(
+            x,
+            M_fwd,
+            M_inv,
+            centroids_n,
+            boundaries_n,
+            centroids_outlier=centroids_o,
+            boundaries_outlier=boundaries_o,
+            n_normal=n_normal,
+        )
+
+        assert out.shape == x.shape
+        # Should be lossy
+        assert not torch.equal(out, x)
+
+    def test_quantize_dequantize_roundtrip(self):
+        """Separate quantize then dequantize should match fused QD."""
+        from vllm.model_executor.layers.quantization.turboquant.triton_kernels import (
+            turboquant_dequantize,
+            turboquant_fused_qd,
+            turboquant_quantize,
+        )
+
+        device = "cuda"
+        head_dim = 128
+
+        signs = generate_random_signs(head_dim, seed=42, device=device)
+        centroids, boundaries = LloydMaxCodebook.get(3, head_dim, device)
+        M_fwd, M_inv = make_rotation_matrices(signs, device)
+
+        x = torch.randn(32, 4, head_dim, device=device)
+
+        # Separate quantize + dequantize
+        indices, norms = turboquant_quantize(
+            x,
+            M_inv,
+            centroids,
+            boundaries,
+        )
+        out_separate = turboquant_dequantize(
+            indices,
+            norms,
+            M_fwd,
+            centroids,
+        )
+
+        # Fused QD
+        out_fused = turboquant_fused_qd(
+            x,
+            M_fwd,
+            M_inv,
+            centroids,
+            boundaries,
+        )
+
+        # Should produce same results (modulo float precision)
+        assert torch.allclose(
+            out_separate,
+            out_fused,
+            atol=1e-2,
+            rtol=1e-2,
+        ), (
+            "Separate Q+DQ should match fused QD: "
+            f"max diff = {(out_separate - out_fused).abs().max():.6f}"
+        )
+
+    def test_quantize_output_shapes(self):
+        """Quantize kernel should produce correct output shapes."""
+        from vllm.model_executor.layers.quantization.turboquant.triton_kernels import (
+            turboquant_quantize,
+        )
+
+        device = "cuda"
+        head_dim = 64
+        num_tokens, num_heads = 24, 8
+
+        signs = generate_random_signs(head_dim, seed=42, device=device)
+        centroids, boundaries = LloydMaxCodebook.get(2, head_dim, device)
+        M_fwd, M_inv = make_rotation_matrices(signs, device)
+
+        x = torch.randn(num_tokens, num_heads, head_dim, device=device)
+        indices, norms = turboquant_quantize(
+            x,
+            M_inv,
+            centroids,
+            boundaries,
+        )
+
+        assert indices.shape == (num_tokens, num_heads, head_dim)
+        assert indices.dtype == torch.uint8
+        assert norms.shape == (num_tokens, num_heads)
+        assert norms.dtype == torch.float16
+
+    def test_quantize_index_range(self):
+        """Quantized indices should be in [0, 2^b - 1]."""
+        from vllm.model_executor.layers.quantization.turboquant.triton_kernels import (
+            turboquant_quantize,
+        )
+
+        device = "cuda"
+        head_dim = 128
+
+        for bit_width in [2, 3, 4]:
+            signs = generate_random_signs(head_dim, seed=42, device=device)
+            centroids, boundaries = LloydMaxCodebook.get(bit_width, head_dim, device)
+            _, M_inv = make_rotation_matrices(signs, device)
+
+            x = torch.randn(64, 4, head_dim, device=device)
+            indices, _ = turboquant_quantize(
+                x,
+                M_inv,
+                centroids,
+                boundaries,
+            )
+
+            max_idx = 2**bit_width - 1
+            assert indices.max().item() <= max_idx, (
+                f"Index {indices.max()} exceeds max {max_idx} at {bit_width} bits"
+            )
+
+    def test_compressor_uses_triton_on_gpu(self):
+        """Compressor should use Triton backend on CUDA."""
+        from vllm.model_executor.layers.quantization.turboquant.compressor import (
+            TurboQuantKVCompressor,
+        )
+
+        device = "cuda"
+        compressor = TurboQuantKVCompressor(
+            bit_width=3.0,
+            head_dim=128,
+            num_kv_heads=4,
+            device=device,
+        )
+        assert compressor.use_triton
+
+        key = torch.randn(16, 4, 128, device=device)
+        value = torch.randn(16, 4, 128, device=device)
+        k_out, v_out = compressor.compress_kv(key, value)
+
+        assert k_out.shape == key.shape
+        assert v_out.shape == value.shape
+        assert k_out.dtype == key.dtype
+
+    def test_compressor_triton_matches_pytorch(self):
+        """Triton compressor should produce similar results to PyTorch."""
+        from vllm.model_executor.layers.quantization.turboquant.compressor import (
+            TurboQuantKVCompressor,
+        )
+
+        head_dim = 128
+        num_kv_heads = 4
+        seed = 42
+
+        # CPU compressor (PyTorch fallback)
+        comp_cpu = TurboQuantKVCompressor(
+            bit_width=3.0,
+            head_dim=head_dim,
+            num_kv_heads=num_kv_heads,
+            seed=seed,
+            device="cpu",
+        )
+
+        # GPU compressor (Triton)
+        comp_gpu = TurboQuantKVCompressor(
+            bit_width=3.0,
+            head_dim=head_dim,
+            num_kv_heads=num_kv_heads,
+            seed=seed,
+            device="cuda",
+        )
+
+        key = torch.randn(32, num_kv_heads, head_dim)
+        value = torch.randn(32, num_kv_heads, head_dim)
+
+        k_cpu, v_cpu = comp_cpu.compress_kv(key, value)
+        k_gpu, v_gpu = comp_gpu.compress_kv(key.cuda(), value.cuda())
+
+        # Results should be close (not identical due to float32 vs
+        # matmul precision differences)
+        assert torch.allclose(
+            k_cpu,
+            k_gpu.cpu(),
+            atol=1e-2,
+            rtol=1e-2,
+        ), (
+            "Triton/PyTorch key mismatch: max diff = "
+            f"{(k_cpu - k_gpu.cpu()).abs().max():.6f}"
+        )
+        assert torch.allclose(
+            v_cpu,
+            v_gpu.cpu(),
+            atol=1e-2,
+            rtol=1e-2,
+        ), (
+            "Triton/PyTorch value mismatch: max diff = "
+            f"{(v_cpu - v_gpu.cpu()).abs().max():.6f}"
+        )

@@ -8,8 +8,9 @@ tensors before they are stored in the standard KV cache. This simulates
 the lossy compression effect of TurboQuant while maintaining compatibility
 with all attention backends (Phase 2).
 
-Actual packed storage with memory savings is deferred to Phase 3
-(custom CUDA kernels).
+When Triton is available (Phase 3), the compressor uses fused GPU kernels
+that combine normalize + rotation + quantize/dequantize + inverse rotation
++ rescale into a single kernel launch for significantly better performance.
 """
 
 import torch
@@ -22,6 +23,11 @@ from vllm.model_executor.layers.quantization.turboquant.rotation import (
     fast_walsh_hadamard_transform,
     generate_random_signs,
 )
+from vllm.model_executor.layers.quantization.turboquant.triton_kernels import (
+    make_rotation_matrices,
+    turboquant_fused_qd,
+)
+from vllm.triton_utils import HAS_TRITON
 
 logger = init_logger(__name__)
 
@@ -101,6 +107,14 @@ class TurboQuantKVCompressor:
             self.outlier_mask[-self.n_outlier :] = True
             self.normal_mask = ~self.outlier_mask
 
+        # Phase 3: Precompute rotation matrices for Triton kernels.
+        # Uses matrix multiply (tl.dot) instead of butterfly Walsh-Hadamard.
+        self.use_triton = HAS_TRITON and device != "cpu" and str(device) != "cpu"
+        if self.use_triton:
+            self.M_fwd_k, self.M_inv_k = make_rotation_matrices(self.signs_k, device)
+            self.M_fwd_v, self.M_inv_v = make_rotation_matrices(self.signs_v, device)
+            logger.info("TurboQuant using Triton fused kernels (Phase 3)")
+
     def _quantize_dequantize_1d(
         self,
         y: torch.Tensor,
@@ -177,6 +191,42 @@ class TurboQuantKVCompressor:
 
         return x_hat.to(orig_dtype)
 
+    def _apply_turboquant_triton(
+        self,
+        x: torch.Tensor,
+        M_fwd: torch.Tensor,
+        M_inv: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply TurboQuant using fused Triton kernel (Phase 3).
+
+        Args:
+            x: Input tensor of shape [num_tokens, num_heads, head_dim].
+            M_fwd: Forward rotation matrix (head_dim, head_dim).
+            M_inv: Inverse rotation matrix (head_dim, head_dim).
+
+        Returns:
+            Quantized-then-dequantized tensor of same shape and dtype.
+        """
+        orig_dtype = x.dtype
+
+        outlier_args: dict = {}
+        if self.has_outliers:
+            outlier_args = {
+                "centroids_outlier": self.centroids_outlier,
+                "boundaries_outlier": self.boundaries_outlier,
+                "n_normal": self.n_normal,
+            }
+
+        result = turboquant_fused_qd(
+            x,
+            M_fwd,
+            M_inv,
+            self.centroids_normal,
+            self.boundaries_normal,
+            **outlier_args,
+        )
+        return result.to(orig_dtype)
+
     def compress_kv(
         self,
         key: torch.Tensor,
@@ -187,6 +237,9 @@ class TurboQuantKVCompressor:
         This applies quantize→dequantize round-trip, producing float
         tensors with TurboQuant's lossy compression applied.
 
+        Uses fused Triton kernels (Phase 3) when available on GPU,
+        falling back to pure PyTorch (Phase 1) on CPU or without Triton.
+
         Args:
             key: Key tensor of shape [num_tokens, num_kv_heads, head_dim].
             value: Value tensor of shape [num_tokens, num_kv_heads, head_dim].
@@ -194,8 +247,16 @@ class TurboQuantKVCompressor:
         Returns:
             Tuple of (compressed_key, compressed_value) with same shape/dtype.
         """
-        key_compressed = self._apply_turboquant_mse(key, self.signs_k)
-        value_compressed = self._apply_turboquant_mse(value, self.signs_v)
+        if self.use_triton:
+            key_compressed = self._apply_turboquant_triton(
+                key, self.M_fwd_k, self.M_inv_k
+            )
+            value_compressed = self._apply_turboquant_triton(
+                value, self.M_fwd_v, self.M_inv_v
+            )
+        else:
+            key_compressed = self._apply_turboquant_mse(key, self.signs_k)
+            value_compressed = self._apply_turboquant_mse(value, self.signs_v)
         return key_compressed, value_compressed
 
     @property
