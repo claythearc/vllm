@@ -348,6 +348,10 @@ def kv_cache_dtype_str_to_dtype(
     if kv_cache_dtype == "auto":
         # Model config may not be specified for unit tests, default to float16
         return model_config.dtype if model_config else torch.half
+    if kv_cache_dtype == "turboquant":
+        # TurboQuant applies quantize-dequantize before storing in cache.
+        # Cache stores float values in the model's native dtype.
+        return model_config.dtype if model_config else torch.half
     return STR_DTYPE_TO_TORCH_DTYPE[kv_cache_dtype]
 
 

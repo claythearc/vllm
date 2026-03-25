@@ -309,6 +309,11 @@ class Attention(nn.Module, AttentionLayerBase):
             cache_config.enable_prefix_caching = False
 
         impl_cls = self.attn_backend.get_impl_cls()
+        # TurboQuant compresses K/V before they reach the backend,
+        # so the backend should see standard float dtype.
+        impl_kv_cache_dtype = (
+            "auto" if kv_cache_dtype == "turboquant" else kv_cache_dtype
+        )
         self.impl = impl_cls(
             num_heads,
             head_size,
@@ -316,7 +321,7 @@ class Attention(nn.Module, AttentionLayerBase):
             num_kv_heads,
             alibi_slopes,
             sliding_window,
-            kv_cache_dtype,
+            impl_kv_cache_dtype,
             logits_soft_cap,
             attn_type,
             kv_sharing_target_layer_name,
@@ -370,6 +375,28 @@ class Attention(nn.Module, AttentionLayerBase):
                 else GroupShape.PER_TENSOR,
             )
 
+        # TurboQuant KV cache compression
+        self.turboquant_compressor = None
+        if self.kv_cache_dtype == "turboquant":
+            from vllm.model_executor.layers.quantization.turboquant.compressor import (
+                TurboQuantKVCompressor,
+            )
+
+            # Get TurboQuant config from quant_config or use defaults
+            tq_params = getattr(self, "turboquant_params", None)
+            tq_bit_width = tq_params.bit_width if tq_params else 3.5
+            tq_outlier = tq_params.outlier_channels if tq_params else 32
+            tq_seed = tq_params.seed if tq_params else 42
+
+            self.turboquant_compressor = TurboQuantKVCompressor(
+                bit_width=tq_bit_width,
+                head_dim=head_size,
+                num_kv_heads=num_kv_heads,
+                outlier_channels=tq_outlier,
+                seed=tq_seed,
+                device="cpu",  # Will be moved to GPU with model
+            )
+
     def forward(
         self,
         query: torch.Tensor,
@@ -391,6 +418,25 @@ class Attention(nn.Module, AttentionLayerBase):
         """
         if self.calculate_kv_scales:
             torch.ops.vllm.maybe_calc_kv_scales(query, key, value, self.layer_name)
+
+        # Apply TurboQuant compression to K/V before caching.
+        # Quantize then dequantize, producing float tensors with
+        # TurboQuant's lossy compression applied.
+        if (
+            self.turboquant_compressor is not None
+            and key is not None
+            and value is not None
+        ):
+            # Key/value shape: [num_tokens, num_kv_heads * head_dim]
+            # Reshape to [num_tokens, num_kv_heads, head_dim] for per-head
+            # quantization, then reshape back.
+            num_tokens = key.shape[0]
+            k_3d = key.view(num_tokens, self.num_kv_heads, self.head_size)
+            v_3d = value.view(num_tokens, self.num_kv_heads, self.head_size_v)
+            k_3d, v_3d = self.turboquant_compressor.compress_kv(k_3d, v_3d)
+            key = k_3d.view(num_tokens, -1)
+            value = v_3d.view(num_tokens, -1)
+
         output_dtype = query.dtype
         if self.query_quant is not None:
             # quantizing with a simple torch operation enables

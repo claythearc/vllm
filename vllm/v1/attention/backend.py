@@ -55,6 +55,7 @@ class AttentionBackend(ABC):
         "auto",
         "float16",
         "bfloat16",
+        "turboquant",
     ]
 
     # Does attention's forward() include kv cache update?
