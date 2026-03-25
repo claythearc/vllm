@@ -5,4 +5,6 @@ from vllm.model_executor.layers.quantization.turboquant.config import (
     TurboQuantConfig,
 )
 
-__all__ = ["TurboQuantConfig"]
+__all__ = [
+    "TurboQuantConfig",
+]

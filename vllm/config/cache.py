@@ -20,6 +20,7 @@ CacheDType = Literal[
     "fp8_e5m2",
     "fp8_inc",
     "fp8_ds_mla",
+    "turboquant",
 ]
 MambaDType = Literal["auto", "float32", "float16"]
 MambaCacheMode = Literal["all", "align", "none"]
@@ -227,5 +228,11 @@ class CacheConfig:
                 "memory footprint and boosts the performance. "
                 "Meanwhile, it may cause accuracy drop without a proper "
                 "scaling factor."
+            )
+        elif cache_dtype == "turboquant":
+            logger.info(
+                "Using TurboQuant for KV cache quantization. "
+                "Online vector quantization with near-optimal distortion "
+                "at 3.5 bits/channel. No calibration data required."
             )
         return cache_dtype

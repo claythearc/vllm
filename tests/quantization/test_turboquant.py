@@ -333,3 +333,137 @@ class TestTurboQuantConfig:
         dtypes = config.get_supported_act_dtypes()
         assert torch.float16 in dtypes
         assert torch.bfloat16 in dtypes
+
+
+# ---- KV Compressor tests (Phase 2) ----
+
+
+class TestTurboQuantKVCompressor:
+    def test_compress_kv_shape(self):
+        """Compressed K/V should have same shape as input."""
+        from vllm.model_executor.layers.quantization.turboquant.compressor import (
+            TurboQuantKVCompressor,
+        )
+
+        compressor = TurboQuantKVCompressor(
+            bit_width=3.0, head_dim=128, num_kv_heads=8, device=DEVICE
+        )
+        key = torch.randn(16, 8, 128)
+        value = torch.randn(16, 8, 128)
+        k_out, v_out = compressor.compress_kv(key, value)
+        assert k_out.shape == key.shape
+        assert v_out.shape == value.shape
+
+    def test_compress_kv_dtype_preservation(self):
+        """Compressed K/V should preserve input dtype."""
+        from vllm.model_executor.layers.quantization.turboquant.compressor import (
+            TurboQuantKVCompressor,
+        )
+
+        compressor = TurboQuantKVCompressor(
+            bit_width=3.0, head_dim=64, num_kv_heads=4, device=DEVICE
+        )
+        key = torch.randn(8, 4, 64, dtype=torch.float16)
+        value = torch.randn(8, 4, 64, dtype=torch.float16)
+        k_out, v_out = compressor.compress_kv(key, value)
+        assert k_out.dtype == torch.float16
+        assert v_out.dtype == torch.float16
+
+    @pytest.mark.parametrize("bit_width", [2.0, 2.5, 3.0, 3.5, 4.0])
+    def test_compression_reduces_information(self, bit_width: float):
+        """Compression should produce lossy output (not identical to input)."""
+        from vllm.model_executor.layers.quantization.turboquant.compressor import (
+            TurboQuantKVCompressor,
+        )
+
+        compressor = TurboQuantKVCompressor(
+            bit_width=bit_width, head_dim=128, num_kv_heads=4, device=DEVICE
+        )
+        key = torch.randn(32, 4, 128)
+        value = torch.randn(32, 4, 128)
+        k_out, v_out = compressor.compress_kv(key, value)
+        # Output should be different from input (lossy compression)
+        assert not torch.equal(key, k_out)
+        assert not torch.equal(value, v_out)
+
+    def test_mixed_precision_outlier_channels(self):
+        """Non-integer bit-widths should use mixed precision."""
+        from vllm.model_executor.layers.quantization.turboquant.compressor import (
+            TurboQuantKVCompressor,
+        )
+
+        compressor = TurboQuantKVCompressor(
+            bit_width=3.5,
+            head_dim=128,
+            num_kv_heads=4,
+            outlier_channels=32,
+            device=DEVICE,
+        )
+        assert compressor.has_outliers
+        assert compressor.bits_normal == 3
+        assert compressor.bits_outlier == 4
+        assert compressor.n_outlier == 32
+        assert compressor.n_normal == 96
+
+        # Verify effective bit-width is as expected
+        expected = (96 * 3 + 32 * 4) / 128  # = 3.25 (not exactly 3.5)
+        assert abs(compressor.effective_bit_width - expected) < 1e-6
+
+    def test_integer_bit_width_no_outliers(self):
+        """Integer bit-widths should not use outlier channels."""
+        from vllm.model_executor.layers.quantization.turboquant.compressor import (
+            TurboQuantKVCompressor,
+        )
+
+        compressor = TurboQuantKVCompressor(
+            bit_width=3.0, head_dim=128, num_kv_heads=4, device=DEVICE
+        )
+        assert not compressor.has_outliers
+
+    @pytest.mark.parametrize("bit_width", [2.0, 3.0, 4.0])
+    def test_mse_improves_with_bits(self, bit_width: float):
+        """Higher bit-width should give lower distortion."""
+        from vllm.model_executor.layers.quantization.turboquant.compressor import (
+            TurboQuantKVCompressor,
+        )
+
+        key = torch.randn(100, 4, 128)
+        value = torch.randn(100, 4, 128)
+
+        compressor = TurboQuantKVCompressor(
+            bit_width=bit_width, head_dim=128, num_kv_heads=4, device=DEVICE
+        )
+        k_out, _ = compressor.compress_kv(key, value)
+        mse = ((key - k_out) ** 2).mean().item()
+
+        if bit_width == 2.0:
+            # At 2 bits, MSE should be non-trivial
+            assert mse > 0.001
+        elif bit_width == 4.0:
+            # At 4 bits, MSE should be small
+            assert mse < 0.05
+
+    def test_compression_ratio(self):
+        """Compression ratio should match theoretical prediction."""
+        from vllm.model_executor.layers.quantization.turboquant.compressor import (
+            TurboQuantKVCompressor,
+        )
+
+        compressor = TurboQuantKVCompressor(
+            bit_width=3.0, head_dim=128, num_kv_heads=4, device=DEVICE
+        )
+        # 16 bits / 3 bits = 5.33x
+        assert abs(compressor.compression_ratio - 16.0 / 3.0) < 1e-6
+
+    def test_repr(self):
+        """Repr should be informative."""
+        from vllm.model_executor.layers.quantization.turboquant.compressor import (
+            TurboQuantKVCompressor,
+        )
+
+        compressor = TurboQuantKVCompressor(
+            bit_width=3.5, head_dim=128, num_kv_heads=4, device=DEVICE
+        )
+        r = repr(compressor)
+        assert "TurboQuantKVCompressor" in r
+        assert "3.5" in r
